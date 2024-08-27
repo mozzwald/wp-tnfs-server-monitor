@@ -6,9 +6,10 @@
  * Author: Joe Honold <mozzwald@gmail.com>
  */
 
+// Ensure WordPress has loaded
 if (!defined('ABSPATH')) exit;
 
-// Register database table
+// Register the plugin's custom database table
 function tnfs_monitor_install() {
     global $wpdb;
     $table_name = $wpdb->prefix . 'tnfs_servers';
@@ -29,7 +30,17 @@ function tnfs_monitor_install() {
 }
 register_activation_hook(__FILE__, 'tnfs_monitor_install');
 
-// Admin menu
+function tnfs_monitor_enqueue_styles() {
+    wp_enqueue_style(
+        'tnfs-monitor-styles',
+        plugin_dir_url(__FILE__) . 'assets/css/style.css',
+        array(),
+        '1.0.0'
+    );
+}
+add_action('wp_enqueue_scripts', 'tnfs_monitor_enqueue_styles');
+
+// Add admin menu
 function tnfs_monitor_menu() {
     add_menu_page('TNFS Monitor', 'TNFS Monitor', 'manage_options', 'tnfs-monitor', 'tnfs_monitor_admin_page');
 }
@@ -56,6 +67,7 @@ function tnfs_monitor_admin_page() {
         $tcp_status = tnfs_check_tcp_status($server_url);
         $udp_status = tnfs_check_udp_status($server_url);
 
+        // Insert the new server into the database
         $wpdb->insert(
             $table_name,
             array('server_url' => $server_url, 'last_check' => current_time('mysql'), 'tcp_status' => $tcp_status ? 'up' : 'down', 'udp_status' => $udp_status ? 'up' : 'down', 'order_index' => '1000'),
@@ -73,6 +85,7 @@ function tnfs_monitor_admin_page() {
 
     // Handle Server list re-ordering
     if (isset($_POST['order']) && check_admin_referer('tnfs_monitor_update_order', 'tnfs_monitor_order_nonce')) {
+        // Update the order in the database
         $order = explode(',', sanitize_text_field($_POST['order']));
         foreach ($order as $index => $server_id) {
             $wpdb->update(
@@ -225,11 +238,8 @@ function tnfs_monitor_cron_function() {
         $tcp_status = tnfs_check_tcp_status($server->server_url);
         $udp_status = tnfs_check_udp_status($server->server_url);
 
-        $is_tcp_down = ($tcp_status === 'DOWN');
-        $is_udp_down = ($udp_status === 'DOWN');
-
         // Check if both TCP and UDP are down
-        if ($is_tcp_down && $is_udp_down) {
+        if (!$tcp_status && !$udp_status) {
             // If both are down and it's the first time, store the timestamp
             if (is_null($server->down_since)) {
                 $down_since = current_time('mysql');
@@ -259,8 +269,8 @@ function tnfs_monitor_cron_function() {
             $table_name,
             array(
                 'last_check' => current_time('mysql'),
-                'tcp_status' => $tcp_status,
-                'udp_status' => $udp_status
+                'tcp_status' => $tcp_status ? 'up' : 'down',
+                'udp_status' => $udp_status ? 'up' : 'down'
             ),
             array('id' => $server->id),
             array('%s', '%s', '%s'),
@@ -268,6 +278,7 @@ function tnfs_monitor_cron_function() {
         );
     }
 }
+
 add_action('tnfs_monitor_cron_event', 'tnfs_monitor_cron_function');
 
 // Parse TNFS response
@@ -298,7 +309,7 @@ function parse_tnfs_response($response) {
 
     return array(
         'session_id' => $session_id,
-        'sequence_id' => $result_code,
+        'sequence_id' => $sequence_id,
         'command' => $command,
         'server_version' => $server_version,
         'min_retry_time' => $min_retry_time
@@ -414,19 +425,22 @@ function tnfs_check_udp_status($host) {
     // Parse the response
     $result = parse_tnfs_response($buffer); // Reuse the TCP parser
 
-    // Send unmount to close the session
-    $packet = pack('n', $result['session_id']); // 2-byte Session ID
-    $packet .= chr(0x00);                // Sequence ID 0
-    $packet .= chr(0x01);                // Command byte UNMOUNT
-    socket_sendto($socket, $packet, strlen($packet), 0, $host, $port);
+	if ($result != false)
+	{
+	    // Send unmount to close the session
+	    $packet = pack('n', $result['session_id']); // 2-byte Session ID
+	    $packet .= chr(0x00);                // Sequence ID 0
+	    $packet .= chr(0x01);                // Command byte UNMOUNT
+	    socket_sendto($socket, $packet, strlen($packet), 0, $host, $port);
 
-    // Receive response
-    $buffer = '';
-    $from = '';
-    $response_length = socket_recvfrom($socket, $buffer, 1024, 0, $from, $port);
+	    // Receive response
+	    $buffer = '';
+	    $from = '';
+	    $response_length = socket_recvfrom($socket, $buffer, 1024, 0, $from, $port);
 
-    // Parse the response
-    $result = parse_tnfs_response($buffer); // Reuse the TCP parser
+	    // Parse the response
+	    $result = parse_tnfs_response($buffer); // Reuse the TCP parser
+	}
 
     // Close the socket
     socket_close($socket);
@@ -451,11 +465,12 @@ function tnfs_monitor_shortcode() {
     ob_start();
     if ($servers) {
         echo '<table style="width: 100%; text-align: center;">';
-        echo '<thead><tr><th>Server URL</th><th>Last Check</th><th>TCP Status</th><th>UDP Status</th><th>Downtime</th></tr></thead>';
+        echo '<thead><tr><th>Server URL</th><th>TCP<br>Status</th><th>UDP<br>Status</th><th>Downtime</th></tr></thead>';
         echo '<tbody>';
         foreach ($servers as $server) {
             $tcp_status_image = ($server->tcp_status === 'up') ? $plugin_url . 'up.svg' : $plugin_url . 'down.svg';
             $udp_status_image = ($server->udp_status === 'up') ? $plugin_url . 'up.svg' : $plugin_url . 'down.svg';
+            $last_check = esc_html($server->last_check); // Save this to display in last row
 
             // Calculate the downtime duration
             $downtime_message = '';
@@ -483,12 +498,12 @@ function tnfs_monitor_shortcode() {
 
             echo '<tr>';
             echo '<td style="text-align: left;">' . esc_html($server->server_url) . '</td>';
-            echo '<td style="text-align: left;">' . esc_html($server->last_check) . '</td>';
-            echo '<td style="text-align: center;"><img src="' . esc_url($tcp_status_image) . '" alt="' . esc_attr($server->tcp_status) . '" width="20" height="20"></td>';
-            echo '<td style="text-align: center;"><img src="' . esc_url($udp_status_image) . '" alt="' . esc_attr($server->udp_status) . '" width="20" height="20"></td>';
+            echo '<td style="text-align: center;"><span class="hovertext" data-hover="Checked at  ' . esc_html($server->last_check) . '"><img src="' . esc_url($tcp_status_image) . '" alt="' . esc_attr($server->tcp_status) . '" width="20" height="20"></span></td>';
+            echo '<td style="text-align: center;"><span class="hovertext" data-hover="Checked at  ' . esc_html($server->last_check) . '"><img src="' . esc_url($udp_status_image) . '" alt="' . esc_attr($server->udp_status) . '" width="20" height="20"></span></td>';
             echo '<td>'.$downtime_message.'</td>';
             echo '</tr>';
         }
+        echo '<tr><td colspan="4">Last checked TNFS status at '.$last_check.'</td></tr>';
         echo '</tbody></table>';
     } else {
         echo '<p>No servers found.</p>';
@@ -497,5 +512,7 @@ function tnfs_monitor_shortcode() {
     return ob_get_clean();
 }
 add_shortcode('tnfs_monitor', 'tnfs_monitor_shortcode');
+
+
 
 ?>
